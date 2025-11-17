@@ -1,9 +1,16 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
+const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Xano configuration
+const XANO_BASE_URL = process.env.XANO_BASE_URL || 'https://xbde-ekcn-8kg2.n7e.xano.io';
+const XANO_CUSTOMER_API_KEY = process.env.XANO_CUSTOMER_API_KEY || 'Q4jDYUWL';
+const XANO_PAYMENT_API_KEY = process.env.XANO_PAYMENT_API_KEY || '05i62DIx';
 
 // Middleware
 app.use(helmet());
@@ -26,8 +33,97 @@ app.get('/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
-// Main callback endpoint matching your documentation
-app.post('/api/payment/v1/response-callback', (req, res) => {
+// Helper function to update customer balance in Xano
+async function updateCustomerBalance(policyNumber, amountPaid, paymentData) {
+  try {
+    // 1. Get customer by policy number
+    const customersResponse = await axios.get(
+      `${XANO_BASE_URL}/api:${XANO_CUSTOMER_API_KEY}/nic_cc_customer`
+    );
+    
+    const customer = customersResponse.data.find(
+      c => c.policy_number === policyNumber
+    );
+    
+    if (!customer) {
+      console.error(`Customer not found for policy: ${policyNumber}`);
+      return { success: false, error: 'Customer not found' };
+    }
+    
+    console.log(`Found customer: ${customer.name}, Current balance: ${customer.amount_due}`);
+    
+    // 2. Calculate new balance
+    const currentBalance = parseFloat(customer.amount_due) || 0;
+    const paid = parseFloat(amountPaid);
+    const newBalance = Math.max(0, currentBalance - paid);
+    
+    console.log(`Updating balance: ${currentBalance} - ${paid} = ${newBalance}`);
+    
+    // 3. Determine new status (only change if fully paid)
+    let newStatus = customer.status;
+    if (newBalance === 0) {
+      newStatus = 'resolved';
+    }
+    
+    // 4. Update customer in Xano
+    await axios.patch(
+      `${XANO_BASE_URL}/api:${XANO_CUSTOMER_API_KEY}/nic_cc_customer/${customer.id}`,
+      {
+        amount_due: newBalance,
+        status: newStatus,
+        last_call_date: new Date().toISOString().split('T')[0]
+      }
+    );
+    
+    console.log(`✅ Customer updated successfully. New balance: ${newBalance}`);
+    
+    // 5. Log payment in Xano
+    try {
+      await axios.post(
+        `${XANO_BASE_URL}/api:${XANO_PAYMENT_API_KEY}/nic_cc_payment`,
+        {
+          customer: customer.id,  // ⭐ CORRECT: Use 'customer' not 'customer_id'
+          policy_number: policyNumber,
+          customer_name: customer.name,
+          transaction_reference: paymentData.transactionReference,
+          end_to_end_reference: paymentData.endToEndReference,
+          amount: paid,
+          mobile_number: paymentData.mobileNumber,
+          payment_date: new Date().toISOString(),
+          payment_status_code: paymentData.paymentStatusCode,
+          status: 'success',
+          old_balance: currentBalance,
+          new_balance: newBalance,
+          processed_at: new Date().toISOString()
+        }
+      );
+      console.log('✅ Payment logged successfully');
+    } catch (paymentLogError) {
+      console.error('⚠️ Failed to log payment:', paymentLogError.message);
+      console.error('Payment log error details:', paymentLogError.response?.data);
+    }
+    
+    return {
+      success: true,
+      customer: customer.name,
+      customerEmail: customer.email,
+      oldBalance: currentBalance,
+      newBalance: newBalance,
+      amountPaid: paid,
+      fullyPaid: newBalance === 0
+    };
+    
+  } catch (error) {
+    console.error('❌ Failed to update customer balance:', error.message);
+    if (error.response) {
+      console.error('Error response:', error.response.data);
+    }
+    return { success: false, error: error.message };
+  }
+}
+
+// Main callback endpoint
+app.post('/api/payment/v1/response-callback', async (req, res) => {
   try {
     const {
       paymentStatusCode,
@@ -36,15 +132,9 @@ app.post('/api/payment/v1/response-callback', (req, res) => {
       transactionReference,
       billNumber,
       mobileNumber,
-      storeLabel,
-      loyaltyNumber,
-      referenceLabel,
-      customerLabel,
-      terminalLabel,
-      purposeOfTransaction
+      customerLabel
     } = req.body;
 
-    // Log the received payment data
     console.log('Payment callback received:', {
       paymentStatusCode,
       endToEndReference,
@@ -52,7 +142,7 @@ app.post('/api/payment/v1/response-callback', (req, res) => {
       transactionReference,
       billNumber,
       mobileNumber,
-      referenceLabel,
+      customerLabel,
       timestamp: new Date().toISOString()
     });
 
@@ -63,18 +153,49 @@ app.post('/api/payment/v1/response-callback', (req, res) => {
       });
     }
 
-    // Process the payment callback (add your business logic here)
-    // For now, just log and acknowledge receipt
-    
-    // Return success response in the expected format
+    // Only process successful payments
+    if (paymentStatusCode === 'ACSP') {
+      console.log('✅ Payment successful, processing...');
+      
+      if (!billNumber) {
+        console.error('❌ No policy number in callback');
+        return res.json({
+          message: "Callback received but no policy number provided"
+        });
+      }
+      
+      // Update customer balance in Xano
+      const updateResult = await updateCustomerBalance(billNumber, amount, {
+        transactionReference,
+        endToEndReference,
+        mobileNumber,
+        paymentStatusCode,
+        customerLabel
+      });
+      
+      if (updateResult.success) {
+        console.log(`✅ Payment processed successfully for ${updateResult.customer}`);
+        console.log(`   Old balance: MUR ${updateResult.oldBalance}`);
+        console.log(`   Amount paid: MUR ${updateResult.amountPaid}`);
+        console.log(`   New balance: MUR ${updateResult.newBalance}`);
+        console.log(`   Status: ${updateResult.fullyPaid ? 'FULLY PAID' : 'PARTIAL PAYMENT'}`);
+      } else {
+        console.error(`❌ Failed to process payment: ${updateResult.error}`);
+      }
+    } else {
+      console.log(`⚠️ Payment not successful. Status: ${paymentStatusCode}`);
+    }
+
+    // Always return success to payment gateway
     res.json({
       message: "Callback received successfully"
     });
-
+    
   } catch (error) {
     console.error('Error processing callback:', error);
-    res.status(500).json({
-      error: 'Internal server error'
+    res.status(200).json({
+      message: "Callback received but processing failed",
+      error: error.message
     });
   }
 });
