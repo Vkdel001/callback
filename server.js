@@ -33,20 +33,41 @@ app.get('/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
+/**
+ * Reverse sanitize policy number
+ * Converts dots back to slashes to match database format
+ * Example: "HEALTH.2024.001" → "HEALTH/2024/001"
+ */
+function reverseSanitizePolicyNumber(sanitizedPolicy) {
+  if (!sanitizedPolicy) return sanitizedPolicy;
+  
+  // Replace all dots with slashes (reverse of QR sanitization)
+  const original = sanitizedPolicy.replace(/\./g, '/');
+  
+  console.log(`🔄 Policy number reverse-sanitized: "${sanitizedPolicy}" → "${original}"`);
+  
+  return original;
+}
+
 // Helper function to update customer balance in Xano
 async function updateCustomerBalance(policyNumber, amountPaid, paymentData) {
   try {
-    // 1. Get customer by policy number
+    // 🔄 STEP 1: Reverse sanitize policy number to match database format
+    const originalPolicyNumber = reverseSanitizePolicyNumber(policyNumber);
+    
+    console.log(`📋 Searching for customer with policy: ${originalPolicyNumber}`);
+    
+    // 2. Get customer by policy number (using original format)
     const customersResponse = await axios.get(
       `${XANO_BASE_URL}/api:${XANO_CUSTOMER_API_KEY}/nic_cc_customer`
     );
     
     const customer = customersResponse.data.find(
-      c => c.policy_number === policyNumber
+      c => c.policy_number === originalPolicyNumber
     );
     
     if (!customer) {
-      console.error(`Customer not found for policy: ${policyNumber}`);
+      console.error(`❌ Customer not found for policy: ${originalPolicyNumber} (sanitized: ${policyNumber})`);
       return { success: false, error: 'Customer not found' };
     }
     
@@ -83,7 +104,7 @@ async function updateCustomerBalance(policyNumber, amountPaid, paymentData) {
         `${XANO_BASE_URL}/api:${XANO_PAYMENT_API_KEY}/nic_cc_payment`,
         {
           customer: customer.id,  // ⭐ CORRECT: Use 'customer' not 'customer_id'
-          policy_number: policyNumber,
+          policy_number: originalPolicyNumber,  // ✅ Use original format for database
           customer_name: customer.name,
           transaction_reference: paymentData.transactionReference,
           end_to_end_reference: paymentData.endToEndReference,
