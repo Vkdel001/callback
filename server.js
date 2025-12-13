@@ -49,6 +49,115 @@ function reverseSanitizePolicyNumber(sanitizedPolicy) {
   return original;
 }
 
+/**
+ * Parse month string to Date for comparison
+ * Converts "MMM-YY" format to Date object
+ * Example: "Jan-25" → Date(2025, 0, 1)
+ */
+function parseMonthString(monthStr) {
+  if (!monthStr || typeof monthStr !== 'string') return null;
+  
+  const parts = monthStr.split('-');
+  if (parts.length !== 2) return null;
+  
+  const [monthName, yearStr] = parts;
+  const year = parseInt('20' + yearStr); // Convert YY to YYYY
+  
+  const monthMap = {
+    'Jan': 0, 'Feb': 1, 'Mar': 2, 'Apr': 3, 'May': 4, 'Jun': 5,
+    'Jul': 6, 'Aug': 7, 'Sep': 8, 'Oct': 9, 'Nov': 10, 'Dec': 11
+  };
+  
+  const month = monthMap[monthName];
+  if (month === undefined) return null;
+  
+  return new Date(year, month, 1);
+}
+
+/**
+ * Find the customer record with the latest assigned_month
+ * Implements Latest Month Priority fallback strategy
+ */
+function findLatestMonthRecord(customerRecords) {
+  if (!customerRecords || customerRecords.length === 0) return null;
+  if (customerRecords.length === 1) return customerRecords[0];
+  
+  let latestRecord = null;
+  let latestDate = null;
+  
+  for (const record of customerRecords) {
+    const monthDate = parseMonthString(record.assigned_month);
+    
+    if (monthDate && (!latestDate || monthDate > latestDate)) {
+      latestDate = monthDate;
+      latestRecord = record;
+    }
+  }
+  
+  // If no valid dates found, return first record as fallback
+  return latestRecord || customerRecords[0];
+}
+
+/**
+ * Enhanced customer lookup with multi-month handling
+ * Implements Latest Month Priority strategy for payment allocation
+ */
+async function findTargetCustomerRecord(originalPolicyNumber) {
+  try {
+    // Get all customers from Xano
+    const customersResponse = await axios.get(
+      `${XANO_BASE_URL}/api:${XANO_CUSTOMER_API_KEY}/nic_cc_customer`
+    );
+    
+    // Find all records matching the policy number
+    const matchingCustomers = customersResponse.data.filter(
+      c => c.policy_number === originalPolicyNumber
+    );
+    
+    if (matchingCustomers.length === 0) {
+      console.error(`❌ No customer found for policy: ${originalPolicyNumber}`);
+      return { success: false, error: 'Customer not found' };
+    }
+    
+    if (matchingCustomers.length === 1) {
+      console.log(`📋 Single record found for policy: ${originalPolicyNumber}`);
+      return {
+        success: true,
+        customer: matchingCustomers[0],
+        selectionReason: 'single_record',
+        totalRecords: 1,
+        alternativeRecords: []
+      };
+    }
+    
+    // Multiple records found - apply Latest Month Priority
+    console.log(`📋 Multiple records found for policy: ${originalPolicyNumber} (${matchingCustomers.length} records)`);
+    
+    // Log all available records
+    matchingCustomers.forEach((record, index) => {
+      console.log(`   Record ${index + 1}: ID=${record.id}, Month=${record.assigned_month}, Balance=${record.amount_due}`);
+    });
+    
+    // Select record with latest month
+    const selectedCustomer = findLatestMonthRecord(matchingCustomers);
+    const alternativeRecords = matchingCustomers.filter(c => c.id !== selectedCustomer.id);
+    
+    console.log(`✅ Selected record: ID=${selectedCustomer.id}, Month=${selectedCustomer.assigned_month} (Latest Month Priority)`);
+    
+    return {
+      success: true,
+      customer: selectedCustomer,
+      selectionReason: 'latest_month_priority',
+      totalRecords: matchingCustomers.length,
+      alternativeRecords: alternativeRecords
+    };
+    
+  } catch (error) {
+    console.error('❌ Error in customer lookup:', error.message);
+    return { success: false, error: error.message };
+  }
+}
+
 // Helper function to update customer balance in Xano
 async function updateCustomerBalance(policyNumber, amountPaid, paymentData) {
   try {
@@ -57,21 +166,26 @@ async function updateCustomerBalance(policyNumber, amountPaid, paymentData) {
     
     console.log(`📋 Searching for customer with policy: ${originalPolicyNumber}`);
     
-    // 2. Get customer by policy number (using original format)
-    const customersResponse = await axios.get(
-      `${XANO_BASE_URL}/api:${XANO_CUSTOMER_API_KEY}/nic_cc_customer`
-    );
+    // 🎯 STEP 2: Enhanced customer lookup with multi-month handling
+    const lookupResult = await findTargetCustomerRecord(originalPolicyNumber);
     
-    const customer = customersResponse.data.find(
-      c => c.policy_number === originalPolicyNumber
-    );
-    
-    if (!customer) {
-      console.error(`❌ Customer not found for policy: ${originalPolicyNumber} (sanitized: ${policyNumber})`);
-      return { success: false, error: 'Customer not found' };
+    if (!lookupResult.success) {
+      console.error(`❌ Customer lookup failed: ${lookupResult.error}`);
+      return { success: false, error: lookupResult.error };
     }
     
-    console.log(`Found customer: ${customer.name}, Current balance: ${customer.amount_due}`);
+    const customer = lookupResult.customer;
+    
+    console.log(`✅ Found customer: ${customer.name}, Current balance: ${customer.amount_due}`);
+    console.log(`📊 Selection details: ${lookupResult.selectionReason} (${lookupResult.totalRecords} total records)`);
+    
+    // Log alternative records for audit trail
+    if (lookupResult.alternativeRecords.length > 0) {
+      console.log(`📝 Alternative records not selected:`);
+      lookupResult.alternativeRecords.forEach((alt, index) => {
+        console.log(`   Alt ${index + 1}: ID=${alt.id}, Month=${alt.assigned_month}, Balance=${alt.amount_due}`);
+      });
+    }
     
     // 2. Calculate new balance
     const currentBalance = parseFloat(customer.amount_due) || 0;
@@ -98,27 +212,35 @@ async function updateCustomerBalance(policyNumber, amountPaid, paymentData) {
     
     console.log(`✅ Customer updated successfully. New balance: ${newBalance}`);
     
-    // 5. Log payment in Xano
+    // 5. Log payment in Xano with enhanced audit trail
     try {
+      const paymentLogData = {
+        customer: customer.id,  // ⭐ CORRECT: Use 'customer' not 'customer_id'
+        policy_number: originalPolicyNumber,  // ✅ Use original format for database
+        customer_name: customer.name,
+        transaction_reference: paymentData.transactionReference,
+        end_to_end_reference: paymentData.endToEndReference,
+        amount: paid,
+        mobile_number: paymentData.mobileNumber,
+        payment_date: new Date().toISOString(),
+        payment_status_code: paymentData.paymentStatusCode,
+        status: 'success',
+        old_balance: currentBalance,
+        new_balance: newBalance,
+        processed_at: new Date().toISOString(),
+        
+        // 🆕 Enhanced audit fields for multi-month tracking
+        assigned_month: customer.assigned_month,
+        selection_reason: lookupResult.selectionReason,
+        total_records_found: lookupResult.totalRecords,
+        alternative_records_count: lookupResult.alternativeRecords.length
+      };
+      
       await axios.post(
         `${XANO_BASE_URL}/api:${XANO_PAYMENT_API_KEY}/nic_cc_payment`,
-        {
-          customer: customer.id,  // ⭐ CORRECT: Use 'customer' not 'customer_id'
-          policy_number: originalPolicyNumber,  // ✅ Use original format for database
-          customer_name: customer.name,
-          transaction_reference: paymentData.transactionReference,
-          end_to_end_reference: paymentData.endToEndReference,
-          amount: paid,
-          mobile_number: paymentData.mobileNumber,
-          payment_date: new Date().toISOString(),
-          payment_status_code: paymentData.paymentStatusCode,
-          status: 'success',
-          old_balance: currentBalance,
-          new_balance: newBalance,
-          processed_at: new Date().toISOString()
-        }
+        paymentLogData
       );
-      console.log('✅ Payment logged successfully');
+      console.log('✅ Payment logged successfully with audit trail');
     } catch (paymentLogError) {
       console.error('⚠️ Failed to log payment:', paymentLogError.message);
       console.error('Payment log error details:', paymentLogError.response?.data);
@@ -131,7 +253,13 @@ async function updateCustomerBalance(policyNumber, amountPaid, paymentData) {
       oldBalance: currentBalance,
       newBalance: newBalance,
       amountPaid: paid,
-      fullyPaid: newBalance === 0
+      fullyPaid: newBalance === 0,
+      
+      // 🆕 Enhanced response with multi-month details
+      assignedMonth: customer.assigned_month,
+      selectionReason: lookupResult.selectionReason,
+      totalRecords: lookupResult.totalRecords,
+      customerId: customer.id
     };
     
   } catch (error) {
@@ -196,6 +324,10 @@ app.post('/api/payment/v1/response-callback', async (req, res) => {
       
       if (updateResult.success) {
         console.log(`✅ Payment processed successfully for ${updateResult.customer}`);
+        console.log(`   Customer ID: ${updateResult.customerId}`);
+        console.log(`   Assigned Month: ${updateResult.assignedMonth}`);
+        console.log(`   Selection Method: ${updateResult.selectionReason}`);
+        console.log(`   Total Records: ${updateResult.totalRecords}`);
         console.log(`   Old balance: MUR ${updateResult.oldBalance}`);
         console.log(`   Amount paid: MUR ${updateResult.amountPaid}`);
         console.log(`   New balance: MUR ${updateResult.newBalance}`);
