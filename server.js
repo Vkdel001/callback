@@ -7,10 +7,16 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Xano configuration
-const XANO_BASE_URL = process.env.XANO_BASE_URL || 'https://xbde-ekcn-8kg2.n7e.xano.io';
-const XANO_CUSTOMER_API_KEY = process.env.XANO_CUSTOMER_API_KEY || 'Q4jDYUWL';
-const XANO_PAYMENT_API_KEY = process.env.XANO_PAYMENT_API_KEY || '05i62DIx';
+// Xano configuration - Use VITE_ variables (matching your .env file)
+const XANO_BASE_URL = process.env.VITE_XANO_BASE_URL || 'https://xbde-ekcn-8kg2.n7e.xano.io';
+const XANO_CUSTOMER_API_KEY = process.env.VITE_XANO_CUSTOMER_API || 'Q4jDYUWL';
+const XANO_PAYMENT_API_KEY = process.env.VITE_XANO_PAYMENT_API || '05i62DIx';
+const XANO_QR_TRANSACTIONS_API_KEY = process.env.VITE_XANO_QR_TRANSACTIONS_API || '6MaKDJBx';
+
+// Email configuration - Use VITE_ variables (matching your .env file)
+const BREVO_API_KEY = process.env.VITE_BREVO_API_KEY;
+const SENDER_EMAIL = process.env.VITE_SENDER_EMAIL || 'arrears@niclmauritius.site';
+const SENDER_NAME = process.env.VITE_SENDER_NAME || 'NIC Life Insurance Mauritius';
 
 // Middleware
 app.use(helmet());
@@ -158,6 +164,296 @@ async function findTargetCustomerRecord(originalPolicyNumber) {
   }
 }
 
+/**
+ * 🆕 Find QR transaction by policy number or QR data
+ * Searches the nic_qr_transactions table for matching records
+ */
+async function findQRTransaction(policyNumber, qrData = null) {
+  try {
+    console.log(`🔍 Searching QR transactions for policy: ${policyNumber}`);
+    
+    // Get all QR transactions
+    const qrResponse = await axios.get(
+      `${XANO_BASE_URL}/api:${XANO_QR_TRANSACTIONS_API_KEY}/nic_qr_transactions`
+    );
+    
+    // Find matching transactions (pending status only)
+    let matchingTransactions = qrResponse.data.filter(
+      t => t.policy_number === policyNumber && t.status === 'pending'
+    );
+    
+    // If QR data provided, try to match by QR data as well
+    if (qrData && matchingTransactions.length === 0) {
+      matchingTransactions = qrResponse.data.filter(
+        t => t.qr_data === qrData && t.status === 'pending'
+      );
+    }
+    
+    if (matchingTransactions.length === 0) {
+      console.log(`📋 No pending QR transactions found for policy: ${policyNumber}`);
+      return { success: false, error: 'No QR transaction found' };
+    }
+    
+    // If multiple transactions, select the most recent one
+    const selectedTransaction = matchingTransactions.sort(
+      (a, b) => new Date(b.created_at) - new Date(a.created_at)
+    )[0];
+    
+    console.log(`✅ Found QR transaction: ID=${selectedTransaction.id}, Type=${selectedTransaction.qr_type}, Agent=${selectedTransaction.agent_name}`);
+    
+    return {
+      success: true,
+      transaction: selectedTransaction,
+      totalFound: matchingTransactions.length
+    };
+    
+  } catch (error) {
+    console.error('❌ Error finding QR transaction:', error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * 🆕 Update QR transaction status to paid
+ */
+async function updateQRTransactionStatus(transactionId, paymentData) {
+  try {
+    const updateData = {
+      status: 'paid',
+      paid_at: new Date().toISOString(),
+      payment_reference: paymentData.transactionReference,
+      payment_amount: parseFloat(paymentData.amount),
+      webhook_data: JSON.stringify(paymentData)
+    };
+    
+    await axios.patch(
+      `${XANO_BASE_URL}/api:${XANO_QR_TRANSACTIONS_API_KEY}/nic_qr_transactions/${transactionId}`,
+      updateData
+    );
+    
+    console.log(`✅ QR transaction ${transactionId} marked as paid`);
+    return { success: true };
+    
+  } catch (error) {
+    console.error(`❌ Failed to update QR transaction ${transactionId}:`, error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * 🆕 Send payment confirmation email to customer
+ */
+async function sendCustomerPaymentConfirmation(transaction, paymentData) {
+  try {
+    if (!transaction.customer_email || !BREVO_API_KEY) {
+      console.log('⚠️ Skipping customer notification - missing email or API key');
+      return { success: false, error: 'Missing email or API key' };
+    }
+    
+    const emailData = {
+      sender: {
+        name: SENDER_NAME,
+        email: SENDER_EMAIL
+      },
+      to: [
+        {
+          email: transaction.customer_email,
+          name: transaction.customer_name || 'Customer'
+        }
+      ],
+      subject: `Payment Confirmation - Policy ${transaction.policy_number}`,
+      htmlContent: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <div style="background: linear-gradient(135deg, #16a34a 0%, #15803d 100%); color: white; padding: 20px; text-align: center;">
+            <h1 style="margin: 0; font-size: 24px;">✅ Payment Confirmed!</h1>
+            <p style="margin: 10px 0 0 0; opacity: 0.9;">Your payment has been successfully processed</p>
+          </div>
+          
+          <div style="padding: 30px; background: #f8f9fa;">
+            <div style="background: white; padding: 25px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+              <h2 style="color: #333; margin-top: 0;">Payment Confirmation</h2>
+              
+              <div style="background: #e8f5e8; padding: 15px; border-radius: 6px; margin: 20px 0;">
+                <p style="margin: 0; color: #2d5a2d; font-weight: bold;">✅ Payment Status: SUCCESSFUL</p>
+              </div>
+              
+              <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+                <tr>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; font-weight: bold; color: #555;">Policy Number:</td>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; color: #333;">${transaction.policy_number}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; font-weight: bold; color: #555;">Customer Name:</td>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; color: #333;">${transaction.customer_name}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; font-weight: bold; color: #555;">Amount Paid:</td>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; color: #333; font-weight: bold;">MUR ${parseFloat(paymentData.amount).toFixed(2)}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; font-weight: bold; color: #555;">Line of Business:</td>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; color: #333;">${transaction.line_of_business}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; font-weight: bold; color: #555;">Transaction Reference:</td>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; color: #333; font-family: monospace;">${paymentData.transactionReference}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0; font-weight: bold; color: #555;">Payment Date:</td>
+                  <td style="padding: 8px 0; color: #333;">${new Date().toLocaleString()}</td>
+                </tr>
+              </table>
+              
+              <div style="background: #f0f7ff; padding: 15px; border-radius: 6px; margin: 20px 0;">
+                <p style="margin: 0; color: #1a5490; font-size: 14px;">
+                  <strong>Thank you!</strong> Your payment has been processed and your account has been updated. 
+                  You will receive an updated statement within 1-2 business days.
+                </p>
+              </div>
+              
+              ${transaction.agent_email ? `
+              <div style="background: #f9fafb; padding: 15px; border-radius: 6px; border: 1px solid #e5e7eb; margin: 20px 0;">
+                <h4 style="margin-top: 0; color: #333;">Your Agent Contact</h4>
+                <p style="margin: 5px 0;"><strong>Name:</strong> ${transaction.agent_name || 'Your Agent'}</p>
+                <p style="margin: 5px 0;"><strong>Email:</strong> ${transaction.agent_email}</p>
+                <p style="margin: 10px 0 0 0; font-size: 14px; color: #666;">For any questions about your policy, please contact your agent.</p>
+              </div>
+              ` : ''}
+            </div>
+          </div>
+          
+          <div style="background: #333; color: white; padding: 20px; text-align: center; font-size: 12px;">
+            <p style="margin: 0; opacity: 0.8;">NIC Life Insurance Mauritius - Payment Confirmation</p>
+            <p style="margin: 5px 0 0 0; opacity: 0.6;">This is an automated message. Please keep this email for your records.</p>
+          </div>
+        </div>
+      `
+    };
+    
+    const response = await axios.post(
+      'https://api.brevo.com/v3/smtp/email',
+      emailData,
+      {
+        headers: {
+          'api-key': BREVO_API_KEY,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    console.log(`✅ Customer confirmation sent to ${transaction.customer_email}`);
+    return { success: true, messageId: response.data.messageId };
+    
+  } catch (error) {
+    console.error('❌ Failed to send customer confirmation:', error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * 🆕 Send payment confirmation email to agent
+ */
+async function sendAgentPaymentNotification(transaction, paymentData) {
+  try {
+    if (!transaction.agent_email || !BREVO_API_KEY) {
+      console.log('⚠️ Skipping agent notification - missing email or API key');
+      return { success: false, error: 'Missing email or API key' };
+    }
+    
+    const emailData = {
+      sender: {
+        name: SENDER_NAME,
+        email: SENDER_EMAIL
+      },
+      to: [
+        {
+          email: transaction.agent_email,
+          name: transaction.agent_name || 'Agent'
+        }
+      ],
+      subject: `Payment Received - QR Code Success`,
+      htmlContent: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; text-align: center;">
+            <h1 style="margin: 0; font-size: 24px;">🎉 Payment Received!</h1>
+            <p style="margin: 10px 0 0 0; opacity: 0.9;">Your QR code has been successfully paid</p>
+          </div>
+          
+          <div style="padding: 30px; background: #f8f9fa;">
+            <div style="background: white; padding: 25px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+              <h2 style="color: #333; margin-top: 0;">Payment Details</h2>
+              
+              <div style="background: #e8f5e8; padding: 15px; border-radius: 6px; margin: 20px 0;">
+                <p style="margin: 0; color: #2d5a2d; font-weight: bold;">✅ Payment Status: SUCCESSFUL</p>
+              </div>
+              
+              <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+                <tr>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; font-weight: bold; color: #555;">Policy Number:</td>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; color: #333;">${transaction.policy_number}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; font-weight: bold; color: #555;">Customer Name:</td>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; color: #333;">${transaction.customer_name}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; font-weight: bold; color: #555;">Amount Paid:</td>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; color: #333; font-weight: bold;">MUR ${parseFloat(paymentData.amount).toFixed(2)}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; font-weight: bold; color: #555;">Line of Business:</td>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; color: #333;">${transaction.line_of_business}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; font-weight: bold; color: #555;">QR Type:</td>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; color: #333;">${transaction.qr_type === 'quick_qr' ? 'Quick QR' : 'Customer Detail QR'}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; font-weight: bold; color: #555;">Transaction Reference:</td>
+                  <td style="padding: 8px 0; border-bottom: 1px solid #eee; color: #333; font-family: monospace;">${paymentData.transactionReference}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0; font-weight: bold; color: #555;">Payment Date:</td>
+                  <td style="padding: 8px 0; color: #333;">${new Date().toLocaleString()}</td>
+                </tr>
+              </table>
+              
+              <div style="background: #f0f7ff; padding: 15px; border-radius: 6px; margin: 20px 0;">
+                <p style="margin: 0; color: #1a5490; font-size: 14px;">
+                  <strong>Great work!</strong> This payment will be reflected in your QR performance dashboard and contribute to your conversion metrics.
+                </p>
+              </div>
+            </div>
+          </div>
+          
+          <div style="background: #333; color: white; padding: 20px; text-align: center; font-size: 12px;">
+            <p style="margin: 0; opacity: 0.8;">NIC Life Insurance Mauritius - Automated Payment Notification</p>
+            <p style="margin: 5px 0 0 0; opacity: 0.6;">This is an automated message. Please do not reply to this email.</p>
+          </div>
+        </div>
+      `
+    };
+    
+    const response = await axios.post(
+      'https://api.brevo.com/v3/smtp/email',
+      emailData,
+      {
+        headers: {
+          'api-key': BREVO_API_KEY,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    console.log(`✅ Agent notification sent to ${transaction.agent_email}`);
+    return { success: true, messageId: response.data.messageId };
+    
+  } catch (error) {
+    console.error('❌ Failed to send agent notification:', error.message);
+    return { success: false, error: error.message };
+  }
+}
+
 // Helper function to update customer balance in Xano
 async function updateCustomerBalance(policyNumber, amountPaid, paymentData) {
   try {
@@ -271,7 +567,7 @@ async function updateCustomerBalance(policyNumber, amountPaid, paymentData) {
   }
 }
 
-// Main callback endpoint
+// 🆕 Enhanced main callback endpoint with QR transaction integration
 app.post('/api/payment/v1/response-callback', async (req, res) => {
   try {
     const {
@@ -313,7 +609,67 @@ app.post('/api/payment/v1/response-callback', async (req, res) => {
         });
       }
       
-      // Update customer balance in Xano
+      // 🔄 STEP 1: Reverse sanitize policy number
+      const originalPolicyNumber = reverseSanitizePolicyNumber(billNumber);
+      
+      // 🎯 STEP 2: Check for QR transaction first (new feature)
+      console.log('🔍 Checking for QR transaction...');
+      const qrResult = await findQRTransaction(originalPolicyNumber);
+      
+      let qrTransactionProcessed = false;
+      let agentNotificationSent = false;
+      
+      if (qrResult.success) {
+        console.log('📱 QR transaction found - processing QR payment...');
+        
+        // Update QR transaction status
+        const qrUpdateResult = await updateQRTransactionStatus(qrResult.transaction.id, {
+          transactionReference,
+          endToEndReference,
+          amount,
+          mobileNumber,
+          paymentStatusCode,
+          customerLabel
+        });
+        
+        if (qrUpdateResult.success) {
+          qrTransactionProcessed = true;
+          console.log('✅ QR transaction updated successfully');
+          
+          // Send notification to customer
+          const customerNotificationResult = await sendCustomerPaymentConfirmation(qrResult.transaction, {
+            transactionReference,
+            amount,
+            endToEndReference
+          });
+          
+          if (customerNotificationResult.success) {
+            console.log('✅ Customer confirmation sent successfully');
+          } else {
+            console.log('⚠️ Customer confirmation failed:', customerNotificationResult.error);
+          }
+          
+          // Send notification to agent
+          const agentNotificationResult = await sendAgentPaymentNotification(qrResult.transaction, {
+            transactionReference,
+            amount,
+            endToEndReference
+          });
+          
+          if (agentNotificationResult.success) {
+            agentNotificationSent = true;
+            console.log('✅ Agent notification sent successfully');
+          } else {
+            console.log('⚠️ Agent notification failed:', agentNotificationResult.error);
+          }
+        } else {
+          console.log('⚠️ QR transaction update failed:', qrUpdateResult.error);
+        }
+      } else {
+        console.log('📋 No QR transaction found - this is a regular payment');
+      }
+      
+      // 🎯 STEP 3: Update customer balance (existing functionality)
       const updateResult = await updateCustomerBalance(billNumber, amount, {
         transactionReference,
         endToEndReference,
@@ -332,6 +688,19 @@ app.post('/api/payment/v1/response-callback', async (req, res) => {
         console.log(`   Amount paid: MUR ${updateResult.amountPaid}`);
         console.log(`   New balance: MUR ${updateResult.newBalance}`);
         console.log(`   Status: ${updateResult.fullyPaid ? 'FULLY PAID' : 'PARTIAL PAYMENT'}`);
+        
+        // 🆕 Log QR transaction processing results
+        if (qrTransactionProcessed) {
+          console.log(`   QR Transaction: ✅ Updated (ID: ${qrResult.transaction.id})`);
+          console.log(`   QR Type: ${qrResult.transaction.qr_type}`);
+          console.log(`   Customer: ${qrResult.transaction.customer_name} (${qrResult.transaction.customer_email})`);
+          console.log(`   Agent: ${qrResult.transaction.agent_name} (${qrResult.transaction.agent_email})`);
+          console.log(`   Customer Confirmation: ${qrResult.transaction.customer_email ? '✅ Sent' : '❌ No Email'}`);
+          console.log(`   Agent Notification: ${agentNotificationSent ? '✅ Sent' : '❌ Failed'}`);
+        } else {
+          console.log(`   QR Transaction: ℹ️ None found (regular payment)`);
+        }
+        
       } else {
         console.error(`❌ Failed to process payment: ${updateResult.error}`);
       }
@@ -369,6 +738,11 @@ app.use((error, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Payment callback server running on port ${PORT}`);
+  console.log(`Enhanced Payment Callback Server running on port ${PORT}`);
   console.log(`Callback endpoint: http://localhost:${PORT}/api/payment/v1/response-callback`);
+  console.log('🆕 Features enabled:');
+  console.log('   ✅ QR Transaction Integration');
+  console.log('   ✅ Agent Payment Notifications');
+  console.log('   ✅ Multi-Month Policy Handling');
+  console.log('   ✅ Enhanced Audit Trail');
 });
