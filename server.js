@@ -76,27 +76,17 @@ function parseMonthString(monthStr) {
 }
 
 /**
- * Find the customer record with the latest assigned_month
- * Implements Latest Month Priority fallback strategy
+ * Find the customer record with the highest ID (most recent)
+ * Implements Highest ID Priority strategy - more reliable than date parsing
  */
-function findLatestMonthRecord(customerRecords) {
+function findLatestRecord(customerRecords) {
   if (!customerRecords || customerRecords.length === 0) return null;
   if (customerRecords.length === 1) return customerRecords[0];
   
-  let latestRecord = null;
-  let latestDate = null;
-  
-  for (const record of customerRecords) {
-    const monthDate = parseMonthString(record.assigned_month);
-    
-    if (monthDate && (!latestDate || monthDate > latestDate)) {
-      latestDate = monthDate;
-      latestRecord = record;
-    }
-  }
-  
-  // If no valid dates found, return first record as fallback
-  return latestRecord || customerRecords[0];
+  // Find record with highest ID (most recent due to auto-increment)
+  return customerRecords.reduce((latest, current) => 
+    current.id > latest.id ? current : latest
+  );
 }
 
 /**
@@ -139,16 +129,16 @@ async function findTargetCustomerRecord(originalPolicyNumber) {
       console.log(`   Record ${index + 1}: ID=${record.id}, Month=${record.assigned_month}, Balance=${record.amount_due}`);
     });
     
-    // Select record with latest month
-    const selectedCustomer = findLatestMonthRecord(matchingCustomers);
+    // Select record with highest ID (most recent)
+    const selectedCustomer = findLatestRecord(matchingCustomers);
     const alternativeRecords = matchingCustomers.filter(c => c.id !== selectedCustomer.id);
     
-    console.log(`✅ Selected record: ID=${selectedCustomer.id}, Month=${selectedCustomer.assigned_month} (Latest Month Priority)`);
+    console.log(`✅ Selected record: ID=${selectedCustomer.id}, Month=${selectedCustomer.assigned_month} (Highest ID Priority)`);
     
     return {
       success: true,
       customer: selectedCustomer,
-      selectionReason: 'latest_month_priority',
+      selectionReason: 'highest_id_priority',
       totalRecords: matchingCustomers.length,
       alternativeRecords: alternativeRecords
     };
