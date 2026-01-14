@@ -36,14 +36,18 @@ app.get('/health', (req, res) => {
 
 /**
  * Reverse sanitize policy number
- * Converts dots back to slashes to match database format
+ * Converts dots back to slashes and double dots back to hyphens
  * Example: "HEALTH.2024.001" → "HEALTH/2024/001"
+ * Example: "p.33.23.44..4.09.23" → "p/33/23/44-4/09/23"
  */
 function reverseSanitizePolicyNumber(sanitizedPolicy) {
   if (!sanitizedPolicy) return sanitizedPolicy;
   
-  // Replace all dots with slashes (reverse of QR sanitization)
-  const original = sanitizedPolicy.replace(/\./g, '/');
+  // IMPORTANT: Replace double dots FIRST (before single dots)
+  // Double dots represent hyphens, single dots represent slashes
+  const original = sanitizedPolicy
+    .replace(/\.\./g, '-')  // Replace double dots with hyphens
+    .replace(/\./g, '/');    // Replace single dots with slashes
   
   console.log(`🔄 Policy number reverse-sanitized: "${sanitizedPolicy}" → "${original}"`);
   
