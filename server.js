@@ -99,15 +99,18 @@ function findLatestRecord(customerRecords) {
  */
 async function findTargetCustomerRecord(originalPolicyNumber) {
   try {
-    // Get all customers from Xano
+    // Get customers matching the policy number from Xano (secure endpoint)
     const customersResponse = await axios.get(
-      `${XANO_BASE_URL}/api:${XANO_CUSTOMER_API_KEY}/nic_cc_customer`
+      `${XANO_BASE_URL}/api:${XANO_CUSTOMER_API_KEY}/get_customer_by_policy`,
+      {
+        params: {
+          policy_number: originalPolicyNumber
+        }
+      }
     );
     
-    // Find all records matching the policy number
-    const matchingCustomers = customersResponse.data.filter(
-      c => c.policy_number === originalPolicyNumber
-    );
+    // Response already filtered by policy number
+    const matchingCustomers = customersResponse.data;
     
     if (matchingCustomers.length === 0) {
       console.error(`❌ No customer found for policy: ${originalPolicyNumber}`);
